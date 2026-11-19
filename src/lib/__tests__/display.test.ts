@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { formatEstimate, isTaskOverdue, formatTags, pluralize } from '../display.js';
 import type { Task } from '../../types.js';
 
@@ -35,6 +35,7 @@ describe('isTaskOverdue', () => {
     project: null,
     due: null,
     defer: null,
+    planned: null,
     estimatedMinutes: null,
     completionDate: null,
     added: null,

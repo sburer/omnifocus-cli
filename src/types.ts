@@ -66,6 +66,7 @@ export interface UpdateTaskOptions {
   flagged?: boolean;
   estimatedMinutes?: number;
   completed?: boolean;
+  dropped?: boolean;
 }
 
 export interface CreateProjectOptions {
@@ -120,6 +121,10 @@ export interface Folder {
 
 export interface FolderFilters {
   includeDropped?: boolean;
+}
+
+export interface CreateFolderResult extends Folder {
+  alreadyExisted: boolean;
 }
 
 export interface TagListOptions {

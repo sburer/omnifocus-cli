@@ -1,8 +1,6 @@
 import { execFile } from 'child_process';
-import { writeFile, unlink } from 'fs/promises';
-import { tmpdir } from 'os';
-import { join } from 'path';
 import { promisify } from 'util';
+import { AutomationPermissionError, consentPreflight, OMNIFOCUS_BUNDLE_ID } from './consent.js';
 import type {
   Task,
   Project,
@@ -22,6 +20,7 @@ import type {
   UpdateTagOptions,
   Folder,
   FolderFilters,
+  CreateFolderResult,
 } from '../types.js';
 
 const execFileAsync = promisify(execFile);
@@ -43,7 +42,7 @@ export class OmniFocus {
         name: task.name,
         note: task.note || null,
         completed: task.completed,
-        dropped: task.dropped,
+        dropped: task.dropDate !== null,
         effectivelyActive: task.effectiveActive,
         flagged: task.flagged,
         project: containingProject ? containingProject.name : null,
@@ -135,13 +134,14 @@ export class OmniFocus {
       return matches[0];
     }
 
-    function findByName(collection, name, typeName) {
+    function findByName(collection, name, typeName, required = true) {
       for (const item of collection) {
         if (item.name === name) {
           return item;
         }
       }
-      throw new Error(typeName + " not found: " + name);
+      if (required) throw new Error(typeName + " not found: " + name);
+      return null;
     }
 
     function assignTags(target, tagNames) {
@@ -247,23 +247,28 @@ export class OmniFocus {
   `;
 
   private async executeJXA(script: string, timeoutMs = 30000): Promise<string> {
-    const tmpFile = join(tmpdir(), `omnifocus-${Date.now()}.js`);
+    const osascript = execFileAsync('osascript', ['-l', 'JavaScript', '-'], {
+      timeout: timeoutMs,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    // osascript's exit status reports failures; ignore EPIPE if it exits before reading stdin.
+    osascript.child.stdin?.on('error', () => {});
+    osascript.child.stdin?.end(script);
 
     try {
-      await writeFile(tmpFile, script, 'utf-8');
-
-      const { stdout } = await execFileAsync('osascript', ['-l', 'JavaScript', tmpFile], {
-        timeout: timeoutMs,
-        maxBuffer: 10 * 1024 * 1024,
-      });
-
+      const { stdout } = await osascript;
       return stdout.trim();
-    } finally {
-      try {
-        await unlink(tmpFile);
-      } catch {
-        /* ignore cleanup errors */
+    } catch (error) {
+      const stderr = (error as { stderr?: string }).stderr;
+      const permission = stderr?.match(/OF_AUTOMATION_PERMISSION:(-?\d+)/);
+      if (permission) throw new AutomationPermissionError(Number(permission[1]));
+      if ((error as NodeJS.ErrnoException & { killed?: boolean }).killed) {
+        throw new Error(
+          `OmniFocus automation did not respond within ${timeoutMs}ms. Check OmniFocus and macOS Automation permissions in this login session.`,
+          { cause: error }
+        );
       }
+      throw error;
     }
   }
 
@@ -278,11 +283,25 @@ export class OmniFocus {
 
   private wrapOmniScript(omniScript: string): string {
     return `
+      ${consentPreflight()}
       const app = Application('OmniFocus');
       app.includeStandardAdditions = true;
       const result = app.evaluateJavascript(${JSON.stringify(omniScript.trim())});
       result;
     `.trim();
+  }
+
+  async checkConsent(requestConsent = false) {
+    const result = await this.executeJXA(`
+      ${consentPreflight(requestConsent)}
+      JSON.stringify({ status: 'granted', osStatus: 0 });
+    `);
+    return {
+      ...JSON.parse(result),
+      execPath: process.execPath,
+      target: OMNIFOCUS_BUNDLE_ID,
+      promptRequested: requestConsent,
+    };
   }
 
   private buildTaskFilters(filters: TaskFilters): string {
@@ -354,6 +373,11 @@ export class OmniFocus {
     }
     if (options.completed !== undefined) {
       updates.push(options.completed ? 'task.markComplete();' : 'task.markIncomplete();');
+    }
+    if (options.dropped !== undefined) {
+      updates.push(
+        options.dropped ? 'task.drop(false, null);' : 'if (task.dropDate) task.active = true;'
+      );
     }
     if (options.estimatedMinutes !== undefined) {
       updates.push(`task.estimatedMinutes = ${options.estimatedMinutes};`);
@@ -569,11 +593,23 @@ export class OmniFocus {
   }
 
   async listInboxTasks(): Promise<Task[]> {
-    return this.getPerspectiveTasks('Inbox');
+    const omniScript = `
+      ${this.OMNI_HELPERS}
+      (() => {
+        const results = [];
+        inbox.apply(task => {
+          if (!task.completed && task.effectiveActive) results.push(serializeTask(task));
+        });
+        return JSON.stringify(results);
+      })();
+    `;
+
+    const output = await this.executeJXA(this.wrapOmniScript(omniScript));
+    return JSON.parse(output);
   }
 
   async getInboxCount(): Promise<number> {
-    const tasks = await this.getPerspectiveTasks('Inbox');
+    const tasks = await this.listInboxTasks();
     return tasks.length;
   }
 
@@ -998,6 +1034,21 @@ export class OmniFocus {
           projectsWithMostTasks,
           projectsWithMostRemaining
         });
+      })();
+    `;
+
+    const output = await this.executeJXA(this.wrapOmniScript(omniScript));
+    return JSON.parse(output);
+  }
+
+  async createFolder(name: string): Promise<CreateFolderResult> {
+    const omniScript = `
+      ${this.OMNI_HELPERS}
+      (() => {
+        const name = "${this.escapeString(name)}";
+        const existing = findByName(folders, name, "Folder", false);
+        const folder = existing || new Folder(name, library.ending);
+        return JSON.stringify({ ...serializeFolder(folder), alreadyExisted: existing !== null });
       })();
     `;
 
